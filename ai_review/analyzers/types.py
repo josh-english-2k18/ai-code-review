@@ -37,6 +37,22 @@ class JSSummary(TypedDict):
     exports: List[str]
 
 
+class CFunctionSummary(TypedDict):
+    name: str
+    params: str
+    return_type: str
+    qualifiers: str
+
+
+class CSummary(TypedDict):
+    includes: List[str]
+    functions: List[CFunctionSummary]
+    structs: List[str]
+    enums: List[str]
+    typedefs: List[str]
+    macros: List[str]
+
+
 class AnalyzerProtocol(Protocol):
     def analyze_content(self, content: str) -> dict:
         ...

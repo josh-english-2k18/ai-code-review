@@ -5,6 +5,7 @@ from typing import Dict, Iterable, Optional
 from ai_review.analyzers.types import AnalyzerProtocol
 from ai_review.analyzers.js_heuristic import JSHeuristicAnalyzer
 from ai_review.analyzers.js_treesitter import TreeSitterJSAnalyzer
+from ai_review.analyzers.c_treesitter import CTreeSitterAnalyzer
 from ai_review.analyzers.python_ast import PythonAnalyzer
 from ai_review.analyzers.errors import AnalyzerError
 
@@ -25,6 +26,12 @@ class AnalyzerRegistry:
             self.register([".ts", ".tsx"], TreeSitterJSAnalyzer("typescript"))
         except AnalyzerError:
             self.register([".js", ".jsx", ".ts", ".tsx"], JSHeuristicAnalyzer())
+
+        # C/C++ headers via tree-sitter
+        try:
+            self.register([".c", ".h"], CTreeSitterAnalyzer())
+        except AnalyzerError:
+            pass  # tree-sitter-c not installed; C files treated as opaque
 
     def register(self, extensions: Iterable[str], analyzer: AnalyzerProtocol):
         for ext in extensions:

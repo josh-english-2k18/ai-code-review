@@ -13,7 +13,7 @@ class Redactor:
         r'(?i)aws[_-]?(access[_-]?key|secret)',
     ]
     ENTROPY_TOKEN_PATTERN = re.compile(r"[A-Za-z0-9+/=_-]{20,}")
-    ENTROPY_THRESHOLD = 3.5
+    ENTROPY_THRESHOLD = 4.5
 
     def __init__(self):
         self.patterns = [re.compile(p) for p in self.SECRET_PATTERNS]

@@ -16,8 +16,9 @@ class GraphService:
         self.reverse_adj_list = {}
         
         for file_path, data in analysis_data.items():
-            imports = data.get("summary", {}).get("imports", [])
-            # Resolve imports to file paths (simplified for now)
+            summary = data.get("summary", {})
+            # C files use "includes"; Python/JS use "imports"
+            imports = summary.get("imports", []) or summary.get("includes", [])
             resolved_imports = self._resolve_imports(file_path, imports, analysis_data.keys())
             self.adj_list[file_path] = resolved_imports
             
@@ -39,8 +40,17 @@ class GraphService:
         """Maps import symbols/strings back to repository file paths."""
         resolved = set()
         file_set = set(all_files)
+        is_c_file = current_file.endswith((".c", ".h"))
+
         for imp in imports:
             if not imp:
+                continue
+
+            # --- C/H include resolution ---
+            if is_c_file:
+                resolved.update(
+                    self._resolve_c_include(current_file, imp, file_set)
+                )
                 continue
 
             candidates = []
@@ -92,6 +102,44 @@ class GraphService:
         for ext in [".py"]:
             candidates.append(os.path.join(base, f"__init__{ext}"))
         return candidates
+
+    def _resolve_c_include(self, current_file: str, include: str, all_files: Set[str]) -> List[str]:
+        """Resolve a C ``#include "header.h"`` to repo file paths.
+
+        Search strategy (mirrors typical ``-I`` flag order):
+        1. Same directory as the including file.
+        2. Common project include dirs (``src/``, ``include/``, ``src/interface/``).
+        3. Anywhere in the repo matching the basename.
+
+        System includes (``<...>``) are ignored — they don't map to repo files.
+        """
+        if include.startswith("<"):
+            return []
+
+        basename = os.path.basename(include)
+        include_dir = os.path.dirname(current_file)
+        resolved: List[str] = []
+
+        # 1. Relative to including file
+        rel = os.path.normpath(os.path.join(include_dir, include))
+        if rel in all_files:
+            resolved.append(rel)
+
+        # 2. Common project-level include directories
+        common_dirs = ["src", "include", "src/interface", "src/common",
+                       "nsc-sim/include", "qemu/patches/common"]
+        for d in common_dirs:
+            candidate = os.path.normpath(os.path.join(d, include))
+            if candidate in all_files:
+                resolved.append(candidate)
+
+        # 3. Basename match anywhere (fallback for flat layouts)
+        if not resolved:
+            for f in all_files:
+                if f.endswith("/" + basename) or f == basename:
+                    resolved.append(f)
+
+        return sorted(set(resolved))
 
     def _bfs_reachable(self, start_node: str, max_depth: int) -> List[str]:
         """Find nodes reachable in reverse graph (downstream consumers) up to max_depth."""
