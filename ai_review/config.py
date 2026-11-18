@@ -1,5 +1,4 @@
 import os
-from typing import Set
 
 class ReviewConfig:
     """Central configuration for risk paths and exclusions."""
@@ -24,8 +23,7 @@ class ReviewConfig:
 
     # Files that should NEVER be included in a review packet
     CORE_EXCLUSIONS = {
-        '.env', '.env.local', '.env.development', '.env.test', '.env.production',
-        '*.pem', '*.key', 'credentials', 'secrets.json'
+        '.env', 'credentials', 'secrets.json',
     }
 
     EXCLUDED_DIR_NAMES = {
@@ -55,7 +53,10 @@ class ReviewConfig:
 
     DEFAULT_DIFF_CONTEXT_LINES = 3
     MAX_DIFF_LINES = 4000
+    MAX_DIFF_PREVIEW_CHARS = 250_000
+    MAX_HUNK_INDEX = 100
     MAX_UNTRACKED_LINES = 400
+    MAX_UNTRACKED_BYTES = 1_000_000
     MAX_CONTEXT_FILES = 40
     MAX_IMPORTS_IN_SUMMARY = 8
     MAX_IMPACT_PER_FILE = 25
@@ -83,16 +84,9 @@ class ReviewConfig:
     @classmethod
     def should_exclude(cls, file_path: str) -> bool:
         """Check if a file should be excluded regardless of git status."""
-        for dirname in cls.EXCLUDED_DIR_NAMES:
-            if file_path.startswith(f"{dirname}/"):
-                return True
-        filename = file_path.split('/')[-1]
-        if filename in cls._exclusions_exact():
-            return True
-        if any(filename.endswith(ext.replace('*', '')) for ext in cls.CORE_EXCLUSIONS if '*' in ext):
-            return True
-        return False
-
-    @classmethod
-    def _exclusions_exact(cls) -> Set[str]:
-        return {e for e in cls.CORE_EXCLUSIONS if '*' not in e}
+        *directories, filename = file_path.lower().split('/')
+        return (
+            not cls.EXCLUDED_DIR_NAMES.isdisjoint(directories)
+            or any(part in cls.CORE_EXCLUSIONS or part.startswith('.env.')
+                   or part.endswith(('.pem', '.key')) for part in (*directories, filename))
+        )

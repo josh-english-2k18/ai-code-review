@@ -1,57 +1,39 @@
-from typing import List
-
 class PromptChunker:
-    """Splits large review packets into manageable chunks for LLMs."""
+    """Split supplemental material at line boundaries, preserving Markdown fences."""
 
     def __init__(self, max_tokens: int = 15000):
-        # Rough estimation: 1 token ~= 4 characters for code
         self.max_chars = max_tokens * 4
 
-    def chunk_packet(self, packet_md: str) -> List[str]:
-        """Split a packet into multiple parts if it exceeds the token budget."""
+    def chunk_packet(self, packet_md: str) -> list[str]:
         if len(packet_md) <= self.max_chars:
             return [packet_md]
 
         chunks = []
-        current_chunk = []
-        current_len = 0
-        in_fence = False
-        fence_marker = None
+        lines = []
+        size = 0
+        fence = ""
+        for line in packet_md.split("\n"):
+            next_fence = fence
+            if not fence and line.startswith("```"):
+                next_fence = line
+            elif fence and line.rstrip() == "```":
+                next_fence = ""
 
-        # Split by lines to keep markdown structure mostly intact
-        for line in packet_md.splitlines():
-            if line.startswith("```"):
-                if in_fence:
-                    in_fence = False
-                    fence_marker = None
-                else:
-                    in_fence = True
-                    fence_marker = line
+            reserve_close = 4 if next_fence else 0
+            line_size = len(line) + 1
+            has_content = lines and lines != [fence]
+            if has_content and size + line_size + reserve_close > self.max_chars and line.rstrip() != "```":
+                if fence:
+                    lines.append("```")
+                chunks.append("\n".join(lines))
+                lines = [fence] if fence else []
+                size = len(fence) + 1 if fence else 0
 
-            if current_len + len(line) + 1 > self.max_chars:
-                if current_chunk:
-                    if in_fence:
-                        current_chunk.append("```")
-                    chunks.append("\n".join(current_chunk))
-                    current_chunk = []
-                    current_len = 0
-                    if in_fence and fence_marker:
-                        current_chunk.append(fence_marker)
-                        current_len += len(fence_marker) + 1
-            
-            current_chunk.append(line)
-            current_len += len(line) + 1
+            lines.append(line)
+            size += line_size
+            fence = next_fence
 
-        if current_chunk:
-            if in_fence:
-                current_chunk.append("```")
-            chunks.append("\n".join(current_chunk))
-
-        # Add index information to chunks
-        final_chunks = []
-        total = len(chunks)
-        for i, content in enumerate(chunks):
-            header = f"## Packet Chunk {i+1} of {total}\n\n"
-            final_chunks.append(header + content)
-
-        return final_chunks
+        if fence:
+            lines.append("```")
+        chunks.append("\n".join(lines))
+        return [f"## Packet Chunk {i} of {len(chunks)}\n\n{chunk}" for i, chunk in enumerate(chunks, 1)]
