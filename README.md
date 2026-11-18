@@ -1,162 +1,94 @@
 <div align="center">
   <img src="logo.png" alt="AI Review Logo" width="200"/>
   <h1>AI Code Review</h1>
-  <p><b>Precision AI-Powered Code Reviews with Deep Architectural Awareness</b></p>
-  
-  [![Python](https://img.shields.io/badge/python-3.12-blue.svg)](https://www.python.org/)
-  [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-  [![Security: Redacted](https://img.shields.io/badge/Security-Redacted-green.svg)](#security--redaction)
-  [![AI: Agent--Ready](https://img.shields.io/badge/AI-Agent--Ready-blueviolet.svg)](#prompt-engineering)
+  <p>Review changes by testing them against intended behavior.</p>
 </div>
 
----
+An automated reviewer can uncover a real defect with only a partial understanding of the design. A persuasive recommendation can also change a requirement the reviewer never saw. AI Code Review gives a repository-aware agent a concise brief to investigate the change and report falsifiable challenges. The author evaluates the evidence and decides what to change.
 
-## 🚀 Overview
+[![From Findings to Falsifiable Challenges. A diagram of how review-induced specification erosion occurs and how behavioral and intent evidence resolve a challenge.](docs/assets/from-findings-to-falsifiable-challenges.png)](docs/assets/from-findings-to-falsifiable-challenges.png)
 
-**AI Code Review** is a high-fidelity code review orchestration tool designed for AI-assisted workflows in the modern DevOps era. Unlike basic diff scripts, it assembles **Review Packets**—rich context containers that combine raw code changes with deep architectural awareness.
+The diagram illustrates the evidence and decisions in the review process. The default workflow uses a brief and a checkout. A supplemental packet is available for reviewers with limited repository access.
 
-It provides AI agents (like Claude, Gemini, or ChatGPT) with the same "system awareness" a Senior Engineer has, leading to higher-quality, evidence-based feedback.
+## Install
 
----
-
-## ✨ Key Features
-
-### 🧠 Structural Context Analysis
-*   **Python AST Compression**: Extracts class/function signatures and docstrings without wasting tokens on implementation bodies.
-*   **JS/TS Heuristics**: Multi-language support for Javascript and Typescript (JSX/TSX) using intelligent heuristic parsing.
-
-### 🛡️ Security & Privacy First
-*   **Automated Redaction**: Scans and masks high-entropy secrets (API keys, tokens, auth headers) before they ever leave your machine.
-*   **Risk Path Flagging**: Automatically identifies and highlights changes in sensitive areas like `auth/`, `security/`, or infrastructure configs.
-*   **Strict Exclusions**: Hardwired protection against accidentally sharing `.env`, `.pem`, or other sensitive assets.
-
-### 🧩 Enterprise Scalability
-*   **Prompt Chunking**: Automatically fragments large changesets into sequential AI-readable parts when token limits are exceeded.
-*   **Review Rubric**: Includes a professional 5-dimension rubric (Correctness, Security, Design, Performance, Maintainability).
-
----
-
-## 🛠️ Installation
+Install Python 3.10 or later and Git, then run this from your clone.
 
 ```bash
-# 1. Clone the repository
-git clone https://github.com/josh-english/ai-code-review.git
-cd ai-code-review
-
-# 2. Install dependencies
-pip install -r requirements.txt
-
-# 3. Install in editable mode
-pip install -e . --user
-
-# 4. Add to your PATH (recommended)
-export PATH="$PATH:$(python3 -m site --user-base)/bin"
+python -m pip install -e .
 ```
 
----
+## Review a change
 
-## 📖 Usage
-
-### Generate an AI Review Prompt
-The core command that builds the final, pipeable prompt for your AI agent.
+Run the command from inside the repository, or pass its path as a positional argument. The brief goes to stdout by default. Use `--output review_prompt.md` to save it.
 
 ```bash
-# Review uncommitted (working) changes
-ai_review prompt --mode working
-
-# Support for large PRs via chunking
-ai_review prompt . --mode working --chunked
-
-# Include untracked files in the review
-ai_review prompt --mode working --include-untracked
-
-# Output to a file
-ai_review prompt --mode working --output review_prompt.md
-
-# Compare branches
-ai_review prompt --base main --head feature-branch
-
-# Pipe to Gemini CLI
-ai_review prompt --mode working | gemini -p
-
-# Annotate diff lines with line numbers (default on)
-ai_review prompt --base main --head feature-branch --line-numbers
-
-# Read-only mode (no cache/guide files written)
-ai_review prompt --base main --head feature-branch --read-only
+ai_review prompt
+ai_review prompt --base main --head HEAD
 ```
 
-### Analyze Repository Structure
-Generate a structural guide (REPO_GUIDE.md) that summarizes the entire repository.
+- **Working tree.** `prompt` compares the staged and unstaged changes together against HEAD, or against the empty tree before the first commit. It includes untracked files that Git does not ignore, subject to the path filters. Use `--no-include-untracked` to limit it to tracked changes.
+- **Branch comparison.** `--base` compares the merge base of the supplied refs with the review head. The head defaults to `HEAD`. Supply a base whenever you pass `--head`. Both refs and their shared history must be available locally.
+- **Author context.** Repeat `--intent` for behavior or design decisions the reviewer should consider. Repeat `--context-file` for regular files to consult. Relative paths are resolved from the repository root and checked at the review target. The brief includes those paths as references.
+
+For example, this brief points to this project's design for branch reviews.
 
 ```bash
-ai_review analyze . --full
+ai_review prompt --intent "Branch reviews use the pinned head for structural context." \
+  --context-file docs/TECHNICAL_DESIGN.md
 ```
 
-### Synthesize Multiple Reviews
-Consolidate feedback from multiple AI agents into a single report.
+## Run the reviewer
+
+Give the brief to an agent with access to the checkout. It uses the diff, relevant callers, tests, and documentation to establish the intended behavior. Commit history and optional author notes can clarify what the change is meant to do.
+
+For a single Grok review session, run the following from the repository.
 
 ```bash
-ai_review synthesize-prompt ./reviews --output final_review_prompt.md
-```
+python3 -m ai_review.cli prompt | grok --no-plan --no-subagents
 ```
 
-### Inspect Changes Only
-Get a clean markdown summary of the diff.
+In automation, pass the base and head refs and configure the agent to inspect the checkout without interactive approval. Author context remains optional. Check for a completed report before marking the job complete, since a tool permission error can end a headless run early.
+
+## Read the outcome
+
+Each challenge names the behavior in question and points to the affected code. It pairs a concrete observation with the evidence for a different expected result, then explains how the author can test both. The author decides whether the challenge holds and what behavior a correction must preserve. A short **Scope** note records what the reviewer inspected and any gap that affects confidence.
+
+For example, a challenge could show that editing shared defaults clears an existing provider override, cite the documented precedence rule and the write path, and give a local check that exercises both updates. The challenge should preserve the requirement that providers without overrides still receive the new defaults. If the precedence rule is disputed or unavailable, the question belongs with the author.
+
+**Unresolved questions** identifies material cases that need more evidence or a decision about intended behavior. **No material challenges established** records a completed review without enough evidence to advance a candidate. **Review blocked** identifies missing access or evidence that prevents meaningful investigation.
+
+To reconcile multiple reports, run `ai_review synthesize-prompt ./reviews` on a directory of Markdown reports. Give the resulting brief to an agent to reconcile the evidence and surface disagreements that still need a decision.
+
+## Supplemental commands
 
 ```bash
-ai_review changes --mode working
-ai_review changes --mode working --max-diff-lines 2000
-ai_review changes --base main --head feature-branch --line-numbers
+ai_review changes --max-diff-lines 2000
+ai_review packet --base main --read-only
+ai_review prompt --with-packet --read-only
+ai_review analyze --full
 ```
 
-### Build a Context Packet
-Generate the raw structural context without the prompt instructions.
+| Command | Output |
+| --- | --- |
+| `changes` | A file summary and a bounded, redacted diff preview. Add `--include-untracked` to include untracked files in working mode. |
+| `packet` | The change summary with structural context and review signals. In working mode, it includes untracked files by default. |
+| `prompt --with-packet` | The review brief with a packet attached. Passing `--max-diff-lines` or either line-number flag also attaches a packet. |
+| `analyze` | A structural guide written to `REPO_GUIDE.md` by default. Use `--full` to rebuild summaries or `--output` to choose a file. |
+
+Use `prompt --chunked` to split a packet into Markdown prompts. For automation, send the chunks to stdout with `--chunk-separator nul`, or use `--output` to write numbered files.
+
+Working-tree packets and `analyze` can use a local analysis cache. Pass `--read-only` to bypass that cache. For `analyze`, this also sends the guide to stdout unless you supply `--output`.
+
+AI Code Review filters common sensitive paths and applies best-effort secret redaction to supplemental material. Agents that inspect the checkout directly should keep sensitive values out of reports.
+
+See the [technical design](docs/TECHNICAL_DESIGN.md) for Git scope, preview limits, and analysis behavior.
+
+## Development
 
 ```bash
-ai_review packet . --include-untracked
-ai_review packet . --max-diff-lines 2000
-ai_review packet . --read-only
+python -m pip install -e '.[dev]'
+python -m pytest
 ```
 
----
-
-## ✅ Testing
-
-```bash
-pip install -e .[dev]
-# or: pip install -r requirements-dev.txt
-pytest
-```
-
----
-
-## 🧩 Optional JS/TS Parsing (Tree-sitter)
-
-For higher-fidelity JS/TS parsing, install tree-sitter bindings:
-
-```bash
-pip install tree_sitter tree_sitter_languages
-```
-
-If unavailable, the tool falls back to regex-based heuristics.
-
----
-
-## 🧬 Project Structure
-
-```text
-ai_review/
-├── analyzers/    # AST and Heuristic structural analyzers
-├── prompt/       # Templates and chunking logic
-├── security/     # Redaction and masking utilities
-├── summarize/    # Packet and Change collection logic
-├── cli.py        # Click-based interface
-└── git_ops.py    # Robust Git integration layer
-```
-
----
-
-<div align="center">
-  <p>Built with ❤️ by Josh English</p>
-</div>
+Structural analysis supports Python, JavaScript, JSX, TypeScript, and TSX. JavaScript and TypeScript use heuristics by default and use Tree-sitter when compatible versions of `tree_sitter<0.22` and `tree_sitter_languages` are installed.
