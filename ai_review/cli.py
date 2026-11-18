@@ -1,289 +1,243 @@
-import click
-import os
-import sys
+import re
+from contextlib import contextmanager
 from pathlib import Path
-from rich.console import Console
+
+import click
 
 from ai_review.config import ReviewConfig
 
-console = Console()
 
-def _print_payload(payload: str):
-    sys.stdout.write(payload)
-    if not payload.endswith("\n"):
-        sys.stdout.write("\n")
-
-def _status_map_from_entries(entries):
-    results = {}
-    for entry in entries:
-        path = entry.get("path")
-        if not path:
-            continue
-        results[path] = {
-            "status": entry.get("status", "M"),
-            "old_path": entry.get("old_path"),
-            "new_path": entry.get("path"),
-        }
-    return results
+def _write(payload: str, output: Path | None = None, *, terminator: str = "\n"):
+    # Preserve non-UTF-8 Git path bytes as visible escape sequences.
+    payload = payload.replace("\0", r"\0").encode("utf-8", errors="backslashreplace").decode("utf-8")
+    if not payload.endswith(terminator):
+        payload += terminator
+    if output is None:
+        click.echo(payload, nl=False)
+    else:
+        output.write_text(payload, encoding="utf-8")
 
 
-def _numstat_map_from_entries(entries):
-    stats = {}
-    for entry in entries:
-        path = entry.get("path")
-        if not path:
-            continue
-        additions = entry.get("additions", "0")
-        deletions = entry.get("deletions", "0")
-        is_binary = additions == "-" or deletions == "-"
-        stats[path] = {
-            "additions": None if is_binary else int(additions),
-            "deletions": None if is_binary else int(deletions),
-            "is_binary": is_binary,
-        }
-    return stats
+@contextmanager
+def _cli_errors():
+    try:
+        yield
+    except (RuntimeError, ValueError, OSError) as exc:
+        raise click.ClickException(str(exc)) from exc
+
+
+def _review_options(command):
+    command = click.option("--head", help="Head ref for branch comparison. Defaults to HEAD.")(command)
+    command = click.option("--base", help="Compare changes from the merge base with this ref.")(command)
+    command = click.option("--mode", type=click.Choice(["working"]), default="working",
+                           expose_value=False, help="Review uncommitted changes when no refs are supplied.")(command)
+    return click.argument("path", default=".", type=click.Path(exists=True, file_okay=False))(command)
+
+
+def _diff_options(command):
+    command = click.option("--line-numbers/--no-line-numbers", default=None,
+                           help="Annotate printed diffs with line numbers. Defaults to on.")(command)
+    return click.option("--max-diff-lines", type=click.IntRange(min=1),
+                        help=f"Limit printed diff lines. Defaults to {ReviewConfig.MAX_DIFF_LINES}.")(command)
+
+
+def _scope(path, base, head):
+    from ai_review.git_ops import GitOps
+
+    if head is not None and base is None:
+        raise click.UsageError("--head requires --base.")
+    git = GitOps.at_worktree_root(path)
+    return git, git.review_target(base, head)
+
+
+def _chunk_destination(output):
+    if output.is_dir() or not output.suffix:
+        return output, "chunk"
+    return output.parent, output.stem
+
+
+def _previous_prompt_outputs(output, chunked, root):
+    if chunked:
+        directory, prefix = _chunk_destination(output)
+        if not directory.is_dir():
+            return set()
+        chunk_name = re.compile(rf"{re.escape(prefix)}\.[0-9]{{2,}}\.md")
+        candidates = (
+            file for file in directory.iterdir()
+            if chunk_name.fullmatch(file.name)
+        )
+    else:
+        candidates = (output,)
+    root = Path(root)
+    paths = set()
+    for candidate in candidates:
+        # Resolve the directory so aliases for the repository root still match Git paths.
+        path = candidate.parent.resolve() / candidate.name
+        if path.is_relative_to(root):
+            paths.add(path.relative_to(root).as_posix())
+    return paths
+
 
 @click.group()
 def main():
-    """AI-Powered Code Review Generator.
-    
-    This tool assembles architectural context and code changes into a 'Review Packet'
-    suitable for piping to AI agents like Claude or Gemini.
-    """
-    pass
+    """Prepare a repository review centered on verifiable challenges."""
+
 
 @main.command()
-@click.argument('path', default='.', type=click.Path(exists=True))
-@click.option('--full', is_flag=True, help='Perform a full repository analysis.')
-@click.option('--incremental', is_flag=True, default=True, help='Update existing analysis.')
-@click.option('--output', type=click.Path(), help='Write guide to file instead of stdout.')
-@click.option('--read-only', is_flag=True, help='Do not write cache or files into the repo.')
-def analyze(path, full, incremental, output, read_only):
-    """Analyze repository and build/update structural summaries."""
+@click.argument("path", default=".", type=click.Path(exists=True, file_okay=False, path_type=Path))
+@click.option("--full", is_flag=True, help="Rebuild all structural summaries.")
+@click.option("--incremental", is_flag=True, default=True, expose_value=False, help="Reuse current summaries.")
+@click.option("--output", type=click.Path(dir_okay=False, path_type=Path), help="Write the guide here.")
+@click.option("--read-only", is_flag=True, help="Print the guide and skip cache writes.")
+def analyze(path, full, output, read_only):
+    """Build a structural guide from the current files."""
     from ai_review.summarize.repo_guide import RepoAnalyzer
 
-    console.print(f"[bold blue]Analyzing repository at: {path}[/bold blue]")
-    
-    analyzer = RepoAnalyzer(path, cache_enabled=not read_only)
-    try:
-        analysis_data = analyzer.analyze(full=full)
-        guide_md = analyzer.generate_guide(analysis_data)
+    with _cli_errors():
+        analyzer = RepoAnalyzer(path, cache_enabled=not read_only)
+        data = analyzer.analyze(full=full)
+        guide = analyzer.generate_guide(data)
+        destination = output if output is not None else (None if read_only else path / "REPO_GUIDE.md")
+        _write(guide, destination)
+        if destination is not None:
+            click.echo(f"Wrote {destination} after analyzing {len(data)} files.", err=True)
 
-        if output:
-            with open(output, "w") as f:
-                f.write(guide_md)
-            console.print(f"[bold green]Structural guide written to: {output}[/bold green]")
-        elif read_only:
-            _print_payload(guide_md)
-        else:
-            guide_path = os.path.join(path, "REPO_GUIDE.md")
-            with open(guide_path, "w") as f:
-                f.write(guide_md)
-            console.print(f"[bold green]Successfully generated structural guide at: {guide_path}[/bold green]")
-
-        console.print(f"Analyzed {len(analysis_data)} files.")
-    except Exception as e:
-        console.print("[bold red]Error:[/bold red]", e)
 
 @main.command()
-@click.argument('path', default='.', type=click.Path(exists=True))
-@click.option('--mode', type=click.Choice(['working']), default='working', help='Review uncommitted changes.')
-@click.option('--base', help='Base ref for branch comparison.')
-@click.option('--head', help='Head ref for branch comparison.')
-@click.option('--max-diff-lines', type=int, default=ReviewConfig.MAX_DIFF_LINES, help='Limit diff size in output.')
-@click.option('--line-numbers/--no-line-numbers', default=True, help='Annotate diff lines with line numbers.')
-def changes(path, mode, base, head, max_diff_lines, line_numbers):
-    """Collect changes and build structured diff summary."""
-    from ai_review.git_ops import GitOps
+@_review_options
+@_diff_options
+@click.option("--include-untracked/--no-include-untracked", default=False, help="Include untracked files.")
+def changes(path, base, head, max_diff_lines, line_numbers, include_untracked):
+    """Print a redacted change summary and annotated diff."""
     from ai_review.summarize.changes import ChangeCollector
 
-    git = GitOps(repo_path=path)
-    try:
-        is_working = (mode == 'working' and not base and not head)
-        diff_text = git.get_diff(base=base, head=head, working=is_working)
-        
-        file_statuses = _status_map_from_entries(
-            git.get_name_status_entries(base=base, head=head, working=is_working)
+    with _cli_errors():
+        git, target = _scope(path, base, head)
+        collector = ChangeCollector.from_git(
+            git, target, include_untracked, max_diff_lines, line_numbers is not False,
         )
-        numstat = _numstat_map_from_entries(
-            git.get_numstat_entries(base=base, head=head, working=is_working)
-        )
-        collector = ChangeCollector(
-            diff_text,
-            file_statuses=file_statuses,
-            numstat=numstat,
-            max_diff_lines=max_diff_lines,
-            annotate_line_numbers=line_numbers,
-        )
-        summary_md = collector.get_markdown_summary()
+        _write(collector.get_markdown_summary())
 
-        _print_payload(summary_md)
-    except Exception as e:
-        console.print("[bold red]Error:[/bold red]", e)
 
 @main.command()
-@click.argument('path', default='.', type=click.Path(exists=True))
-@click.option('--mode', type=click.Choice(['working']), default='working', help='Review uncommitted changes.')
-@click.option('--base', help='Base ref for branch comparison.')
-@click.option('--head', help='Head ref for branch comparison.')
-@click.option('--max-diff-lines', type=int, default=ReviewConfig.MAX_DIFF_LINES, help='Limit diff size in output.')
-@click.option('--include-untracked/--no-include-untracked', default=True, help='Include untracked files in diff.')
-@click.option('--line-numbers/--no-line-numbers', default=True, help='Annotate diff lines with line numbers.')
-@click.option('--read-only', is_flag=True, help='Do not write cache or files into the repo.')
-def packet(path, mode, base, head, max_diff_lines, include_untracked, line_numbers, read_only):
-    """Build review packet (structured context without prompt wrapper)."""
+@_review_options
+@_diff_options
+@click.option("--include-untracked/--no-include-untracked", default=True, help="Include untracked files.")
+@click.option("--read-only", is_flag=True, help="Skip cache writes.")
+def packet(path, base, head, max_diff_lines, line_numbers, include_untracked, read_only):
+    """Print supplemental material for an offline or limited-access review."""
+    from ai_review.summarize.changes import ChangeCollector
     from ai_review.summarize.packet import PacketBuilder
-    
-    builder = PacketBuilder(path, cache_enabled=not read_only)
-    try:
-        packet_md = builder.build_packet(
-            mode=mode,
-            base=base,
-            head=head,
-            max_diff_lines=max_diff_lines,
-            include_untracked=include_untracked,
-            annotate_line_numbers=line_numbers,
+
+    with _cli_errors():
+        git, target = _scope(path, base, head)
+        collector = ChangeCollector.from_git(
+            git, target, include_untracked, max_diff_lines, line_numbers is not False,
         )
-        _print_payload(packet_md)
-    except Exception as e:
-        console.print("[bold red]Error:[/bold red]", e)
+        _write(PacketBuilder(git, cache_enabled=not read_only).build(target, collector))
+
 
 @main.command()
-@click.argument('path', default='.', type=click.Path(exists=True))
-@click.option('--mode', type=click.Choice(['working']), default='working', help='Review uncommitted changes.')
-@click.option('--base', help='Base ref for branch comparison.')
-@click.option('--head', help='Head ref for branch comparison.')
-@click.option('--chunked', is_flag=True, help='Split output for large changesets.')
-@click.option('--chunk-separator', type=click.Choice(['divider', 'nul']), default='divider', help='Chunk separator for output.')
-@click.option('--output', type=click.Path(), help='Write prompt to file (or directory when chunked).')
-@click.option('--max-diff-lines', type=int, default=ReviewConfig.MAX_DIFF_LINES, help='Limit diff size in output.')
-@click.option('--include-untracked/--no-include-untracked', default=True, help='Include untracked files in diff.')
-@click.option('--line-numbers/--no-line-numbers', default=True, help='Annotate diff lines with line numbers.')
-@click.option('--read-only', is_flag=True, help='Do not write cache or files into the repo.')
-def prompt(path, mode, base, head, chunked, chunk_separator, output, max_diff_lines, include_untracked, line_numbers, read_only):
-    """Build complete review prompt ready for piping to an agent."""
-    from ai_review.summarize.packet import PacketBuilder
+@_review_options
+@click.option("--intent", multiple=True, metavar="TEXT", help="Author notes on intended behavior. Repeatable.")
+@click.option("--context-file", multiple=True, metavar="PATH", help="Point to a file at the review target. Repeatable.")
+@click.option("--include-untracked/--no-include-untracked", default=True, help="Include untracked files in working mode.")
+@click.option("--output", type=click.Path(path_type=Path), help="Write the prompt to a file.")
+@click.option("--with-packet", is_flag=True, help="Attach a supplemental packet for limited-access agents.")
+@click.option("--chunked", is_flag=True, help="Attach supplemental material in separate chunks.")
+@click.option("--chunk-separator", type=click.Choice(["divider", "nul"]), default="divider", help="Chunk separator.")
+@click.option("--read-only", is_flag=True, help="Skip cache writes when attaching a packet.")
+@_diff_options
+def prompt(path, base, head, intent, context_file, include_untracked, output, with_packet,
+           chunked, chunk_separator, read_only, max_diff_lines, line_numbers):
+    """Write a concise, read-in-place brief for a reviewing agent."""
     from ai_review.prompt.composer import PromptComposer
-    from ai_review.prompt.chunker import PromptChunker
 
-    builder = PacketBuilder(path, cache_enabled=not read_only)
-    
-    # Get the templates directory relative to this file
-    templates_dir = os.path.join(os.path.dirname(__file__), "prompt", "templates")
-    composer = PromptComposer(templates_dir)
-    
-    try:
-        packet_md = builder.build_packet(
-            mode=mode,
-            base=base,
-            head=head,
-            max_diff_lines=max_diff_lines,
-            include_untracked=include_untracked,
-            annotate_line_numbers=line_numbers,
+    with _cli_errors():
+        git, target = _scope(path, base, head)
+        omit_untracked = (
+            _previous_prompt_outputs(output, chunked, git.repo_path)
+            if output is not None and target.working and include_untracked else ()
         )
+        with_packet = with_packet or chunked or max_diff_lines is not None or line_numbers is not None
+        collector = None
+        if with_packet:
+            from ai_review.summarize.changes import ChangeCollector
 
-        if chunked:
-            chunker = PromptChunker()
-            packet_chunks = chunker.chunk_packet(packet_md)
-            total = len(packet_chunks)
-            chunk_info_template = "This is chunk {i} of {total}. Provide review for only the visible content."
-            final_instruction = (
-                "Return a PARTIAL review for this chunk in Markdown. "
-                "Do not assume missing context. End with a short 'Needs More Context' "
-                "line if additional chunks are required."
+            collector = ChangeCollector.from_git(
+                git, target, include_untracked, max_diff_lines, line_numbers is not False,
+                omit_untracked=omit_untracked,
             )
 
-            if output:
-                output_path = Path(output)
-                if output_path.suffix:
-                    base_name = output_path.stem
-                    output_dir = output_path.parent
-                else:
-                    base_name = "chunk"
-                    output_dir = output_path
-                output_dir.mkdir(parents=True, exist_ok=True)
-                for i, packet_chunk in enumerate(packet_chunks, 1):
-                    chunk_info = chunk_info_template.format(i=i, total=total)
-                    full_prompt = composer.compose(
-                        packet_chunk,
-                        chunk_info=chunk_info,
-                        final_instruction=final_instruction,
-                    )
-                    chunk_path = output_dir / f"{base_name}.{i:02d}.md"
-                    with open(chunk_path, "w") as f:
-                        f.write(full_prompt)
-                console.print(f"[bold green]Chunked prompts written to: {output_dir}[/bold green]")
-                return
+        entries = collector.entries if collector is not None else git.review_entries(
+            target, include_untracked, omit_untracked=omit_untracked,
+        )
+        brief = PromptComposer().compose(git, target, entries, include_untracked, intent, context_file)
+        if collector is not None:
+            from ai_review.summarize.packet import PacketBuilder
 
-            for i, packet_chunk in enumerate(packet_chunks, 1):
-                chunk_info = chunk_info_template.format(i=i, total=total)
-                full_prompt = composer.compose(
-                    packet_chunk,
-                    chunk_info=chunk_info,
-                    final_instruction=final_instruction,
-                )
-                if chunk_separator == "nul":
-                    sys.stdout.write(full_prompt + "\0")
-                else:
-                    _print_payload(full_prompt)
-                    _print_payload("\n" + "="*40 + "\n")
-            if chunk_separator == "nul":
-                sys.stdout.flush()
+            material = PacketBuilder(git, cache_enabled=not read_only).build(target, collector)
+            if chunked:
+                _write_chunked(brief, material, output, chunk_separator)
+                return
+            brief += "\n\n" + material
+        _write(brief, output)
+        if output is not None:
+            click.echo(f"Wrote {output}.", err=True)
+
+
+def _write_chunked(brief, material, output, separator):
+    from ai_review.prompt.chunker import PromptChunker
+
+    chunks = PromptChunker().chunk_packet(material)
+    if output is not None:
+        destination, prefix = _chunk_destination(output)
+        destination.mkdir(parents=True, exist_ok=True)
+
+    for i, chunk in enumerate(chunks, 1):
+        prompt_text = f"{brief}\n\n{chunk}"
+        if len(chunks) > 1:
+            prompt_text += ("\n\nThis excerpt covers part of the change. Record what you inspected "
+                            "and use the checkout to fill material gaps.")
+        if output is not None:
+            _write(prompt_text, destination / f"{prefix}.{i:02d}.md")
+        elif separator == "nul":
+            _write(prompt_text, terminator="\0")
         else:
-            full_prompt = composer.compose(packet_md)
-            if output:
-                with open(output, "w") as f:
-                    f.write(full_prompt)
-                console.print(f"[bold green]Prompt written to: {output}[/bold green]")
-            else:
-                _print_payload(full_prompt)
-    except Exception as e:
-        console.print("[bold red]Error:[/bold red]", e)
+            if i > 1:
+                click.echo("\n" + "=" * 40 + "\n")
+            _write(prompt_text)
+
+    if output is not None:
+        click.echo(f"Wrote {len(chunks)} prompt(s) to {destination}.", err=True)
+
 
 @main.command()
-@click.argument('reviews_dir', type=click.Path(exists=True))
-@click.option('--output', type=click.Path(), help='Write to file instead of stdout.')
+@click.argument("reviews_dir", type=click.Path(exists=True, file_okay=False, path_type=Path))
+@click.option("--output", type=click.Path(dir_okay=False, path_type=Path), help="Write the synthesis prompt here.")
 def synthesize_prompt(reviews_dir, output):
-    """Generate a synthesis prompt from multiple review files."""
-    
-    reviews = []
-    for f in os.listdir(reviews_dir):
-        if f.endswith(".md"):
-            with open(os.path.join(reviews_dir, f), "r") as r:
-                reviews.append(f"### Review from {f}\n\n{r.read()}")
-    
-    if not reviews:
-        console.print("[yellow]No markdown reviews found in directory.[/yellow]")
-        return
+    """Ask an agent to reconcile review challenges from Markdown reports."""
+    from ai_review.markdown import inline_code
+    from ai_review.prompt.composer import PromptComposer
+    from ai_review.security.redact import Redactor
 
-    synthesis_template = """
-# Review Synthesis Task
+    with _cli_errors():
+        reports = []
+        redactor = Redactor()
+        for path in sorted(reviews_dir.glob("*.md")):
+            if path.is_symlink() or not path.is_file() or (output and path.resolve() == output.resolve()):
+                continue
+            report, _ = redactor.redact(
+                path.read_text(encoding="utf-8"), detect_entropy=False, literal_assignments=True,
+            )
+            quoted = "\n".join(f"> {line}" for line in report.splitlines())
+            reports.append(f"### Report {inline_code(path.name)}\n\n{quoted}")
+        if not reports:
+            raise click.ClickException("No Markdown review reports found.")
+        _write(PromptComposer().synthesize(reports), output)
+        if output is not None:
+            click.echo(f"Wrote {output}.", err=True)
 
-You have been provided with several partial code reviews for a large changeset.
-Your task is to synthesize these into a single, cohesive, and professional Final Code Review Report.
 
-## Input Reviews
-{reviews}
-
-## Requirements
-1.  **Deduplicate**: If multiple reviews point out the same issue, consolidate them.
-2.  **Prioritize**: Highlight blocking issues clearly.
-3.  **Consistency Check**: Resolve any conflicting feedback between different reviews.
-4.  **Final Verdict**: Provide a single final verdict (APPROVE, REQUEST_CHANGES, or COMMENT).
-5.  **Professional Tone**: Maintain a mentorship-quality, professional tone throughout.
-
-## Output Format
-Follow the standard Review Rubric structure (Summary, Verdict, Blocking Issues, Recommendations, etc.).
-"""
-    full_prompt = synthesis_template.format(reviews="\n\n---\n\n".join(reviews))
-    
-    if output:
-        with open(output, "w") as f:
-            f.write(full_prompt)
-        console.print(f"[bold green]Synthesis prompt written to: {output}[/bold green]")
-    else:
-        _print_payload(full_prompt)
-
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
-# Modifying existing file

@@ -1,12 +1,11 @@
 [project]
 name = "ai-review"
 version = "0.1.0"
-description = "AI-Powered Code Review Generator"
+description = "Repository-aware review briefs for verifiable challenges"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
     "click>=8.0.0",
-    "rich>=12.0.0",
 ]
 
 [project.optional-dependencies]
@@ -17,8 +16,11 @@ dev = [
 [project.scripts]
 ai_review = "ai_review.cli:main"
 
-[tool.setuptools]
-packages = ["ai_review"]
+[tool.setuptools.packages.find]
+include = ["ai_review*"]
+
+[tool.setuptools.package-data]
+"ai_review.prompt" = ["templates/*.md"]
 
 [build-system]
 requires = ["setuptools>=61.0"]
