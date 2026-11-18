@@ -4,7 +4,6 @@ from typing import Dict, Iterable, Optional
 
 from ai_review.analyzers.types import AnalyzerProtocol
 from ai_review.analyzers.js_heuristic import JSHeuristicAnalyzer
-from ai_review.analyzers.js_treesitter import TreeSitterJSAnalyzer
 from ai_review.analyzers.python_ast import PythonAnalyzer
 from ai_review.analyzers.errors import AnalyzerError
 
@@ -12,19 +11,12 @@ from ai_review.analyzers.errors import AnalyzerError
 class AnalyzerRegistry:
     """Registry for language-specific analyzers."""
 
+    JS_GRAMMARS = {".js": "javascript", ".jsx": "javascript", ".ts": "typescript", ".tsx": "tsx"}
+
     def __init__(self):
         self._by_ext: Dict[str, AnalyzerProtocol] = {}
-        self._register_defaults()
-
-    def _register_defaults(self):
+        self._by_grammar: Dict[str, AnalyzerProtocol] = {}
         self.register([".py"], PythonAnalyzer())
-
-        # Prefer tree-sitter if available; fallback to regex heuristics.
-        try:
-            self.register([".js", ".jsx"], TreeSitterJSAnalyzer("javascript"))
-            self.register([".ts", ".tsx"], TreeSitterJSAnalyzer("typescript"))
-        except AnalyzerError:
-            self.register([".js", ".jsx", ".ts", ".tsx"], JSHeuristicAnalyzer())
 
     def register(self, extensions: Iterable[str], analyzer: AnalyzerProtocol):
         for ext in extensions:
@@ -34,4 +26,15 @@ class AnalyzerRegistry:
         for ext, analyzer in self._by_ext.items():
             if file_path.endswith(ext):
                 return analyzer
-        return None
+        _, dot, extension = file_path.rpartition(".")
+        grammar = self.JS_GRAMMARS.get(dot + extension)
+        if grammar is None:
+            return None
+        if grammar not in self._by_grammar:
+            from ai_review.analyzers.js_treesitter import TreeSitterJSAnalyzer
+
+            try:
+                self._by_grammar[grammar] = TreeSitterJSAnalyzer(grammar)
+            except AnalyzerError:
+                self._by_grammar[grammar] = JSHeuristicAnalyzer()
+        return self._by_grammar[grammar]

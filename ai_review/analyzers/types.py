@@ -7,6 +7,7 @@ class PythonFunctionSummary(TypedDict):
     name: str
     args: List[str]
     docstring: Optional[str]
+    is_async: bool
 
 
 class PythonClassSummary(TypedDict):
@@ -20,6 +21,7 @@ class PythonSummary(TypedDict):
     functions: List[PythonFunctionSummary]
     docstring: Optional[str]
     imports: List[str]
+    from_imports: List[str]
 
 
 class JSFunctionSummary(TypedDict):

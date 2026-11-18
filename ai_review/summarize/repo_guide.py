@@ -1,69 +1,84 @@
-import os
-from typing import Dict, Any, List
+from collections.abc import Collection
+from hashlib import sha256
+from io import BytesIO
+from tokenize import detect_encoding
 
-from ai_review.repo_scan import RepoScanner
-from ai_review.cache.store import CacheStore
-from ai_review.analyzers.registry import AnalyzerRegistry
 from ai_review.analyzers.errors import AnalyzerError
+from ai_review.analyzers.registry import AnalyzerRegistry
+from ai_review.cache.store import CacheStore
+from ai_review.markdown import inline_code
+from ai_review.repo_scan import RepoScanner
+from ai_review.security.redact import Redactor
+
+
+def decode_source(path: str, source: bytes) -> str:
+    encoding = detect_encoding(BytesIO(source).readline)[0] if path.endswith(".py") else "utf-8-sig"
+    return source.decode(encoding)
+
 
 class RepoAnalyzer:
-    """Orchestrates the analysis of the entire repository."""
+    """Build structural summaries from the source actually being analyzed."""
 
-    def __init__(self, repo_path: str, cache_enabled: bool = True, cache_dir: str | None = None):
-        self.repo_path = repo_path
+    def __init__(
+        self,
+        repo_path: str,
+        cache_enabled: bool = True,
+        cache_dir: str | None = None,
+        registry: AnalyzerRegistry | None = None,
+    ):
         self.scanner = RepoScanner(repo_path)
-        self.cache = CacheStore(repo_path, enabled=cache_enabled, cache_dir=cache_dir)
-        self.registry = AnalyzerRegistry()
+        self.cache = CacheStore(self.scanner.git.repo_path, enabled=cache_enabled, cache_dir=cache_dir)
+        self.registry = registry if registry is not None else AnalyzerRegistry()
 
-    def analyze(self, full: bool = False) -> Dict[str, Any]:
-        """Perform full or incremental analysis."""
-        all_files = self.scanner.scan()
-        hashes = self.scanner.get_file_hashes(all_files)
-        cache_data = self.cache.load() if not full else {}
-        
+    def analyze(
+        self, full: bool = False, extra_paths: tuple[str, ...] = (), *,
+        exclude_paths: Collection[str] = (),
+    ) -> dict:
+        all_files = sorted(set(self.scanner.scan()).union(extra_paths).difference(exclude_paths))
+        cache_data = {} if full else self.cache.load()
         new_cache = {}
-        for file_path in all_files:
-            current_hash = hashes.get(file_path)
-            cached_entry = cache_data.get(file_path)
-            
-            if not full and cached_entry and cached_entry.get("hash") == current_hash:
-                new_cache[file_path] = cached_entry
+        for path in all_files:
+            file = self.scanner.git.worktree_file(path)
+            if file is None:
                 continue
-            
-            # Analyze file
-            full_path = os.path.join(self.repo_path, file_path)
-            analyzer = self.registry.get(file_path)
-            
-            if analyzer:
-                try:
-                    with open(full_path, "r") as f:
-                        content = f.read()
-                    summary = analyzer.analyze_content(content)
-                    new_cache[file_path] = {
-                        "hash": current_hash,
-                        "summary": summary,
-                        "type": "structural"
-                    }
-                except (AnalyzerError, UnicodeDecodeError, SyntaxError, ValueError) as e:
-                    new_cache[file_path] = {"hash": current_hash, "error": str(e)}
-            else:
-                new_cache[file_path] = {"hash": current_hash, "type": "generic"}
+            analyzer = self.registry.get(path)
+            if analyzer is None:
+                new_cache[path] = {"type": "generic"}
+                continue
 
-        self.cache.save(new_cache)
+            try:
+                source = file.read_bytes()
+            except OSError:
+                continue
+            fingerprint = f"4:{type(analyzer).__name__}:{sha256(source).hexdigest()}"
+            cached = cache_data.get(path)
+            if isinstance(cached, dict) and cached.get("hash") == fingerprint:
+                new_cache[path] = cached
+                continue
+
+            try:
+                summary = analyzer.analyze_content(decode_source(path, source))
+            except (AnalyzerError, UnicodeError, SyntaxError, LookupError) as exc:
+                new_cache[path] = {"hash": fingerprint, "error": str(exc)}
+            else:
+                new_cache[path] = {"hash": fingerprint, "summary": summary, "type": "structural"}
+
+        # Explicit untracked paths belong to this review only.
+        extras = set(extra_paths)
+        persistent = {path: entry for path, entry in new_cache.items() if path not in extras}
+        if full or persistent != cache_data:
+            self.cache.save(persistent)
         return new_cache
 
-    def generate_guide(self, analysis_data: Dict[str, Any]) -> str:
-        """Generate a REPO_GUIDE.md string from analysis data."""
+    def generate_guide(self, analysis_data: dict) -> str:
         lines = ["# Repository Structural Guide", ""]
-        
-        for file_path, data in sorted(analysis_data.items()):
-            if "summary" in data:
-                analyzer = self.registry.get(file_path)
-                if analyzer:
-                    lines.append(f"## File: `{file_path}`")
-                    lines.append("```")
-                    lines.append(analyzer.format_summary(data["summary"]))
-                    lines.append("```")
+        redactor = Redactor()
+        for path, data in sorted(analysis_data.items()):
+            analyzer = self.registry.get(path)
+            if analyzer and "summary" in data:
+                summary, _ = redactor.redact(analyzer.format_summary(data["summary"]))
+                if summary:
+                    lines.extend([f"## File: {inline_code(path)}", ""])
+                    lines.extend(f"    {line}" for line in summary.split("\n"))
                     lines.append("")
-        
         return "\n".join(lines)

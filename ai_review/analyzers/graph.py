@@ -1,3 +1,4 @@
+from collections import deque
 from typing import Dict, List, Set, Any
 import os
 
@@ -15,10 +16,12 @@ class GraphService:
         self.adj_list = {}
         self.reverse_adj_list = {}
         
+        all_files = set(analysis_data)
         for file_path, data in analysis_data.items():
-            imports = data.get("summary", {}).get("imports", [])
-            # Resolve imports to file paths (simplified for now)
-            resolved_imports = self._resolve_imports(file_path, imports, analysis_data.keys())
+            summary = data.get("summary", {})
+            imports = summary.get("imports", [])
+            from_imports = set(summary.get("from_imports", []))
+            resolved_imports = self._resolve_imports(file_path, imports, from_imports, all_files)
             self.adj_list[file_path] = resolved_imports
             
             for imp in resolved_imports:
@@ -35,12 +38,18 @@ class GraphService:
                 impact[f] = impacted
         return impact
 
-    def _resolve_imports(self, current_file: str, imports: List[str], all_files: Set[str]) -> List[str]:
+    def _resolve_imports(
+        self, current_file: str, imports: List[str], from_imports: Set[str], all_files: Set[str],
+    ) -> List[str]:
         """Maps import symbols/strings back to repository file paths."""
         resolved = set()
-        file_set = set(all_files)
+        is_python = current_file.endswith(".py")
         for imp in imports:
             if not imp:
+                continue
+
+            if is_python:
+                resolved.update(self._resolve_python_import(current_file, imp, all_files, imp in from_imports))
                 continue
 
             candidates = []
@@ -60,31 +69,47 @@ class GraphService:
                     candidates.extend(self._candidate_paths(base))
             if alias_match:
                 for path in candidates:
-                    if path in file_set:
+                    if path in all_files:
                         resolved.add(path)
                 continue
 
-            # Relative paths (JS/TS)
             if imp.startswith("."):
                 base_dir = os.path.dirname(current_file)
                 base = os.path.normpath(os.path.join(base_dir, imp))
                 candidates.extend(self._candidate_paths(base))
             else:
-                # Python-style module path
-                imp_path = imp.replace(".", "/")
-                candidates.extend(self._candidate_paths(imp_path))
-
+                candidates.extend(self._candidate_paths(imp))
             for path in candidates:
-                if path in file_set:
+                if path in all_files:
                     resolved.add(path)
 
         return sorted(resolved)
 
+    def _resolve_python_import(
+        self, current_file: str, imp: str, all_files: Set[str], from_import: bool,
+    ) -> Set[str]:
+        module = imp.lstrip(".")
+        level = len(imp) - len(module)
+        parent = os.path.dirname(current_file) if level else ""
+        for _ in range(1, level):
+            if not parent:
+                return set()
+            parent = os.path.dirname(parent)
+        base = os.path.join(parent, module.replace(".", "/"))
+        candidates = {base + ".py", os.path.join(base, "__init__.py")}
+        matches = candidates & all_files
+        if matches or not from_import:
+            return matches
+
+        parent = os.path.dirname(base)
+        candidates = {os.path.join(parent, "__init__.py")}
+        if parent:
+            candidates.add(parent + ".py")
+        return candidates & all_files
+
     def _candidate_paths(self, base: str) -> List[str]:
-        if os.path.splitext(base)[1]:
-            return [base]
         extensions = [".ts", ".tsx", ".js", ".jsx", ".py"]
-        candidates = []
+        candidates = [base]
         for ext in extensions:
             candidates.append(f"{base}{ext}")
         for ext in extensions:
@@ -99,11 +124,11 @@ class GraphService:
             return []
             
         visited = {start_node}
-        queue = [(start_node, 0)]
+        queue = deque([(start_node, 0)])
         reachable = []
         
         while queue:
-            node, depth = queue.pop(0)
+            node, depth = queue.popleft()
             if depth >= max_depth:
                 continue
                 

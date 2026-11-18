@@ -21,20 +21,24 @@ class PythonAnalyzer:
             "functions": [],
             "docstring": ast.get_docstring(tree),
             "imports": [],
+            "from_imports": [],
         }
 
         for node in tree.body:
             if isinstance(node, ast.ClassDef):
                 summary["classes"].append(self._analyze_class(node))
-            elif isinstance(node, ast.FunctionDef):
+            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 summary["functions"].append(self._analyze_function(node))
             elif isinstance(node, ast.Import):
                 for name in node.names:
                     summary["imports"].append(name.name)
             elif isinstance(node, ast.ImportFrom):
-                module = node.module or ""
+                module = "." * node.level + (node.module or "")
+                prefix = module + "." if node.module else module
                 for name in node.names:
-                    summary["imports"].append(f"{module}.{name.name}")
+                    imported = f"{prefix}{name.name}"
+                    summary["imports"].append(imported)
+                    summary["from_imports"].append(imported)
 
         return summary
 
@@ -50,11 +54,30 @@ class PythonAnalyzer:
         )
 
     def _analyze_function(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> PythonFunctionSummary:
-        args = [arg.arg for arg in node.args.args]
+        positional_only = len(node.args.posonlyargs)
+        positional = [*node.args.posonlyargs, *node.args.args]
+        first_default = len(positional) - len(node.args.defaults)
+        args = [
+            f"{arg.arg}=..." if index >= first_default else arg.arg
+            for index, arg in enumerate(positional)
+        ]
+        if positional_only:
+            args.insert(positional_only, "/")
+        if node.args.vararg:
+            args.append(f"*{node.args.vararg.arg}")
+        elif node.args.kwonlyargs:
+            args.append("*")
+        args.extend(
+            f"{arg.arg}=..." if default is not None else arg.arg
+            for arg, default in zip(node.args.kwonlyargs, node.args.kw_defaults)
+        )
+        if node.args.kwarg:
+            args.append(f"**{node.args.kwarg.arg}")
         return PythonFunctionSummary(
             name=node.name,
             args=args,
             docstring=ast.get_docstring(node),
+            is_async=isinstance(node, ast.AsyncFunctionDef),
         )
 
     def format_summary(self, summary: Dict[str, Any]) -> str:
@@ -75,9 +98,13 @@ class PythonAnalyzer:
             if cls["docstring"]:
                 lines.append(f"    \"\"\"{cls['docstring']}\"\"\"")
             for method in cls["methods"]:
-                lines.append(f"    def {method['name']}({', '.join(method['args'])}): ...")
+                lines.append(f"    {self._format_function(method)}")
 
         for func in summary["functions"]:
-            lines.append(f"def {func['name']}({', '.join(func['args'])}): ...")
+            lines.append(self._format_function(func))
 
         return "\n".join(lines)
+
+    def _format_function(self, function: PythonFunctionSummary) -> str:
+        prefix = "async def" if function.get("is_async") else "def"
+        return f"{prefix} {function['name']}({', '.join(function['args'])}): ..."
